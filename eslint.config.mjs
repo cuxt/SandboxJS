@@ -1,10 +1,10 @@
-const eslint = require('@eslint/js');
-const tseslint = require('@typescript-eslint/eslint-plugin');
-const tsparser = require('@typescript-eslint/parser');
-const globals = require('globals');
-const prettierConfig = require('eslint-config-prettier');
+import eslint from '@eslint/js'
+import tseslint from '@typescript-eslint/eslint-plugin'
+import tsparser from '@typescript-eslint/parser'
+import globals from 'globals'
+import prettierConfig from 'eslint-config-prettier'
 
-module.exports = [
+export default [
   // Global ignores
   {
     ignores: [
@@ -17,7 +17,7 @@ module.exports = [
       'test/eval/jquery.min.js',
       'rollup.config.mjs',
       'jest.config.js',
-      'eslint.config.js'
+      'eslint.config.mjs'
     ]
   },
   // Base config for all TypeScript files
@@ -49,7 +49,7 @@ module.exports = [
       '@typescript-eslint/no-unsafe-function-type': 'off',
       'no-fallthrough': 'off',
       '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^lastLastLastLastPart' }],
-      '@typescript-eslint/no-unsafe-assignment': 'off',
+      '@typescript-eslint/no-unsafe-assignment': 'off'
     }
   }
-];
+]

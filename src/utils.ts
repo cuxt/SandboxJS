@@ -128,6 +128,28 @@ export function createContext(sandbox: SandboxExec, options: IOptions): IContext
     sandboxedFunctions: new WeakSet<Function>(),
   };
   context.prototypeWhitelist.set(Object.getPrototypeOf([][Symbol.iterator]()) as object, new Set());
+  // Fetch API 构造函数本身（静态方法如 Response.json）也加白名单
+  if (typeof Response !== 'undefined')
+    context.prototypeWhitelist.set(Response.prototype, new Set());
+  if (typeof Request !== 'undefined') context.prototypeWhitelist.set(Request.prototype, new Set());
+  if (typeof Headers !== 'undefined') context.prototypeWhitelist.set(Headers.prototype, new Set());
+  if (typeof FormData !== 'undefined')
+    context.prototypeWhitelist.set(FormData.prototype, new Set());
+  if (typeof Blob !== 'undefined') context.prototypeWhitelist.set(Blob.prototype, new Set());
+  if (typeof URLSearchParams !== 'undefined')
+    context.prototypeWhitelist.set(URLSearchParams.prototype, new Set());
+  if (typeof AbortController !== 'undefined')
+    context.prototypeWhitelist.set(AbortController.prototype, new Set());
+  if (typeof ReadableStream !== 'undefined')
+    context.prototypeWhitelist.set(ReadableStream.prototype, new Set());
+  if (typeof TransformStream !== 'undefined')
+    context.prototypeWhitelist.set(TransformStream.prototype, new Set());
+  if (typeof WritableStream !== 'undefined')
+    context.prototypeWhitelist.set(WritableStream.prototype, new Set());
+  if (typeof TextEncoder !== 'undefined')
+    context.prototypeWhitelist.set(TextEncoder.prototype, new Set());
+  if (typeof TextDecoder !== 'undefined')
+    context.prototypeWhitelist.set(TextDecoder.prototype, new Set());
   return context;
 }
 

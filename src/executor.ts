@@ -385,19 +385,58 @@ addOps<unknown, PropertyKey>(LispType.Prop, ({ done, a, b, obj, context, scope }
       }
     }
 
+    // Fast path: check own properties of `a` first (handles static methods like Body.json)
+    if (hasOwnProperty(a, b)) {
+      const replace = context.ctx.options.prototypeReplacements.get(a as Function);
+      if (replace) {
+        done(undefined, new Prop(replace(a as object, true), b));
+        return;
+      }
+      if (context.ctx.sandboxedFunctions.has(a as Function)) {
+        done(undefined, new Prop(a, b, false, false));
+        return;
+      }
+      // Check if constructor or any ancestor is whitelisted
+      let ctorProt: {} | null = (a as Function).prototype;
+      while (ctorProt !== null) {
+        const whitelist = context.ctx.prototypeWhitelist.get(ctorProt as Function);
+        if (whitelist && (!whitelist.size || whitelist.has(b))) {
+          done(undefined, new Prop(a, b, false, false));
+          return;
+        }
+        ctorProt = Object.getPrototypeOf(ctorProt);
+      }
+      if (typeof a === 'function') {
+        // Constructor not whitelisted, throw
+        throw new SandboxAccessError(
+          `Method or property access not permitted: ${(a as Function).name}.${b.toString()}`,
+        );
+      }
+    }
+
     let prot: {} = a;
     while ((prot = Object.getPrototypeOf(prot))) {
       if (hasOwnProperty(prot, b) || b === '__proto__') {
-        const whitelist = context.ctx.prototypeWhitelist.get(prot);
         const replace = context.ctx.options.prototypeReplacements.get(prot.constructor);
         if (replace) {
           done(undefined, new Prop(replace(a, false), b));
           return;
         }
-        if (
-          (whitelist && (!whitelist.size || whitelist.has(b))) ||
-          context.ctx.sandboxedFunctions.has(prot.constructor)
-        ) {
+        if (context.ctx.sandboxedFunctions.has(prot.constructor)) {
+          break;
+        }
+        // Check if this constructor or any ancestor in its prototype chain is whitelisted
+        let ctorProt: {} | null = prot.constructor;
+        let whitelisted = false;
+        while (ctorProt !== null) {
+          const whitelist = context.ctx.prototypeWhitelist.get(ctorProt as Function);
+          if (whitelist && (!whitelist.size || whitelist.has(b))) {
+            whitelisted = true;
+            break;
+          }
+          ctorProt = Object.getPrototypeOf(ctorProt);
+        }
+        if (whitelisted) {
           break;
         }
         if (b === '__proto__') {

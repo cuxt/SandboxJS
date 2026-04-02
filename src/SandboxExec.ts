@@ -198,6 +198,11 @@ export default class SandboxExec {
       Symbol,
       Date,
       RegExp,
+      // Fetch API
+      Response,
+      Request,
+      Headers,
+      FormData,
     ];
     const map = new Map<any, Set<string>>();
     protos.forEach((proto) => {

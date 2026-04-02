@@ -1,28 +1,41 @@
 {
-  "name": "@nyariv/sandboxjs",
-  "version": "0.8.35",
-  "description": "Javascript sandboxing library.",
+  "name": "@cuxt/sandboxjs",
+  "version": "0.1.0",
+  "description": "JavaScript sandboxing library with prototype whitelist and safe globals.",
   "main": "dist/node/Sandbox.js",
-  "module": "./build/Sandbox.js",
-  "browser": "./dist/Sandbox.min.js",
+  "module": "build/Sandbox.js",
+  "browser": "dist/Sandbox.min.js",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./build/Sandbox.js",
+      "require": "./dist/node/Sandbox.js",
+      "types": "./build/Sandbox.d.ts"
+    }
+  },
+  "files": [
+    "build",
+    "dist"
+  ],
   "scripts": {
     "test": "NODE_OPTIONS='--no-warnings=ExperimentalWarning' jest",
     "build": "tsc --project tsconfig.json --outDir build --declaration && rollup -c",
     "lint": "prettier --check \"**/*.+(ts|json)\" && eslint --ext .ts .",
     "lint:fix": "prettier --write \"**/*.+(ts|json)\" && eslint --ext .ts --fix .",
     "patch": "npm version patch",
-    "prepare": "husky"
+    "minor": "npm version minor",
+    "major": "npm version major"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nyariv/SandboxJS.git"
+    "url": "git@github.com:cuxt/SandboxJS.git"
   },
   "author": "",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/nyariv/SandboxJS/issues"
+    "url": "https://github.com/cuxt/SandboxJS/issues"
   },
-  "homepage": "https://github.com/nyariv/SandboxJS#readme",
+  "homepage": "https://github.com/cuxt/SandboxJS#readme",
   "devDependencies": {
     "@rollup/plugin-node-resolve": "^16.0.3",
     "@rollup/plugin-terser": "^1.0.0",
