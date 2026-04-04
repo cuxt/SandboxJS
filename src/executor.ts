@@ -553,7 +553,21 @@ addOps<unknown, Lisp[], any>(LispType.Call, ({ done, a, b, obj, context }) => {
     let ret = evl ? evl(obj, ...vals) : obj(...vals);
     ret = getGlobalProp(ret, context) || ret;
     sanitizeArray(ret, context);
-    done(undefined, ret);
+    // If the function returns a Promise, await it before signaling completion.
+    // Without this, `done(undefined, promise)` resolves the outer await immediately,
+    // but the Promise itself is still pending — causing async ops to be skipped.
+    if (ret != null && typeof ret.then === 'function') {
+      ret.then(
+        (resolved: unknown) => {
+          done(undefined, resolved);
+        },
+        (err: unknown) => {
+          done(err);
+        },
+      );
+    } else {
+      done(undefined, ret);
+    }
     return;
   }
   if (obj.context[obj.prop] === JSON.stringify && context.getSubscriptions.size) {
