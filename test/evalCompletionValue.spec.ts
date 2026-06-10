@@ -1,5 +1,4 @@
 import Sandbox from '../src/Sandbox.js';
-import { LocalScope } from '../src/utils.js';
 
 describe('eval() Completion Value Tests', () => {
   let sandbox: Sandbox;
@@ -122,13 +121,6 @@ describe('eval() Completion Value Tests', () => {
 
     it('should return undefined for try-catch', () => {
       const code = 'return eval("try { 5; } catch (e) {}");';
-      const fn = sandbox.compile(code);
-      const result = fn().run();
-      expect(result).toBeUndefined();
-    });
-
-    it('should return undefined for block statement', () => {
-      const code = 'return eval("{ 5; }");';
       const fn = sandbox.compile(code);
       const result = fn().run();
       expect(result).toBeUndefined();

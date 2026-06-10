@@ -1,31 +1,17 @@
-import { IEvalContext } from './eval.js';
-import { Change, ExecReturn, executeTree, executeTreeAsync } from './executor.js';
-import {
-  createContext,
+import type { IEvalContext } from './eval';
+import { Change, ExecReturn, executeTree, executeTreeAsync } from './executor';
+import { createContext, SandboxExecutionQuotaExceededError } from './utils';
+import type {
   IContext,
   IExecContext,
   IGlobals,
   IOptionParams,
   IOptions,
   IScope,
-  replacementCallback,
-  SandboxExecutionQuotaExceededError,
-  sandboxedGlobal,
-  Scope,
+  ISymbolWhitelist,
   SubscriptionSubject,
-  Ticks,
-} from './utils.js';
-
-export {
-  IOptions,
-  IContext,
-  IExecContext,
-  LocalScope,
-  SandboxExecutionTreeError,
-  SandboxCapabilityError,
-  SandboxAccessError,
-  SandboxError,
-} from './utils.js';
+  HaltContext,
+} from './utils';
 
 function subscribeSet(
   obj: object,
@@ -60,7 +46,7 @@ function subscribeSet(
   };
 }
 
-export default class SandboxExec {
+export class SandboxExec {
   public readonly context: IContext;
   public readonly setSubscriptions: WeakMap<
     SubscriptionSubject,
@@ -71,9 +57,7 @@ export default class SandboxExec {
     Set<(modification: Change) => void>
   > = new WeakMap();
   public readonly sandboxFunctions: WeakMap<Function, IExecContext> = new WeakMap();
-  private haltSubscriptions: Set<
-    (args?: { error: Error; ticks: Ticks; scope: Scope; context: IExecContext }) => void
-  > = new Set();
+  private haltSubscriptions: Set<(context: HaltContext) => void> = new Set();
   private resumeSubscriptions: Set<() => void> = new Set();
   public halted = false;
   timeoutHandleCounter = 0;
@@ -103,9 +87,14 @@ export default class SandboxExec {
         forbidFunctionCalls: false,
         forbidFunctionCreation: false,
         globals: SandboxExec.SAFE_GLOBALS,
+        symbolWhitelist: SandboxExec.SAFE_SYMBOLS,
         prototypeWhitelist: SandboxExec.SAFE_PROTOTYPES,
-        prototypeReplacements: new Map<new () => any, replacementCallback>(),
         maxParserRecursionDepth: 256,
+        nonBlocking: false,
+        functionReplacements: new Map<
+          Function,
+          (ctx: IExecContext, builtInReplacement?: Function) => Function
+        >(),
       },
       options || {},
     );
@@ -169,6 +158,25 @@ export default class SandboxExec {
       Date,
       RegExp,
     };
+  }
+
+  static get SAFE_SYMBOLS(): ISymbolWhitelist {
+    const safeSymbols: ISymbolWhitelist = {};
+    for (const key of [
+      'asyncIterator',
+      'iterator',
+      'match',
+      'matchAll',
+      'replace',
+      'search',
+      'split',
+    ]) {
+      const value = (Symbol as unknown as Record<string, symbol | undefined>)[key];
+      if (typeof value === 'symbol') {
+        safeSymbols[key] = value;
+      }
+    }
+    return safeSymbols;
   }
 
   static get SAFE_PROTOTYPES(): Map<any, Set<string>> {
@@ -255,9 +263,7 @@ export default class SandboxExec {
     return subscribeSet(obj, name, callback, this);
   }
 
-  subscribeHalt(
-    cb: (args?: { error: Error; ticks: Ticks; scope: Scope; context: IExecContext }) => void,
-  ) {
+  subscribeHalt(cb: (context: HaltContext) => void) {
     this.haltSubscriptions.add(cb);
     return {
       unsubscribe: () => {
@@ -274,7 +280,7 @@ export default class SandboxExec {
     };
   }
 
-  haltExecution(haltContext?: { error: Error; ticks: Ticks; scope: Scope; context: IExecContext }) {
+  haltExecution(haltContext: HaltContext = { type: 'manual' }) {
     if (this.halted) return;
     this.halted = true;
     for (const cb of this.haltSubscriptions) {
@@ -284,7 +290,10 @@ export default class SandboxExec {
 
   resumeExecution() {
     if (!this.halted) return;
-    if (this.context.ticks.tickLimit && this.context.ticks.ticks >= this.context.ticks.tickLimit) {
+    if (
+      this.context.ticks.tickLimit !== undefined &&
+      this.context.ticks.ticks >= this.context.ticks.tickLimit
+    ) {
       throw new SandboxExecutionQuotaExceededError('Cannot resume execution: tick limit exceeded');
     }
     this.halted = false;
@@ -298,10 +307,12 @@ export default class SandboxExec {
   }
 
   executeTree<T>(context: IExecContext, scopes: IScope[] = []): ExecReturn<T> {
-    return executeTree(context.ctx.ticks, context, context.tree, scopes);
+    return executeTree(context.ctx.ticks, context, context.tree, scopes, undefined, false);
   }
 
   executeTreeAsync<T>(context: IExecContext, scopes: IScope[] = []): Promise<ExecReturn<T>> {
-    return executeTreeAsync(context.ctx.ticks, context, context.tree, scopes);
+    return executeTreeAsync(context.ctx.ticks, context, context.tree, scopes, undefined, false);
   }
 }
+
+export default SandboxExec;

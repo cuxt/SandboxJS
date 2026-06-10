@@ -1,0 +1,1752 @@
+import type { LispItem, Lisp, StatementLabel } from '../parser';
+import {
+  hasOwnProperty,
+  isLisp,
+  LispType,
+  LocalScope,
+  Prop,
+  SandboxExecutionQuotaExceededError,
+  SandboxError,
+  SandboxExecutionTreeError,
+  Scope,
+  GeneratorFunction,
+  AsyncGeneratorFunction,
+  SandboxCapabilityError,
+  SandboxAccessError,
+  NON_BLOCKING_THRESHOLD,
+  sanitizeProp,
+  Unknown,
+} from '../utils';
+import { IAuditReport, IExecContext, IScope, optional, Ticks } from '../utils';
+
+export type Done<T = any> = (err?: any, res?: T | typeof optional) => void;
+
+export type ControlFlowAction = 'break' | 'continue';
+
+export interface ControlFlowSignal {
+  type: ControlFlowAction;
+  label?: string;
+}
+
+interface ControlFlowTarget {
+  label?: string;
+  acceptsBreak: boolean;
+  acceptsContinue: boolean;
+  acceptsUnlabeledBreak: boolean;
+  acceptsUnlabeledContinue: boolean;
+}
+
+export type ControlFlowTargets = readonly ControlFlowTarget[] | undefined;
+
+export class ExecReturn<T> {
+  constructor(
+    public auditReport: IAuditReport | undefined,
+    public result: T,
+    public returned: boolean,
+    public controlFlow?: ControlFlowSignal,
+  ) {}
+
+  get breakLoop() {
+    return this.controlFlow?.type === 'break';
+  }
+
+  get continueLoop() {
+    return this.controlFlow?.type === 'continue';
+  }
+}
+
+export interface IChange {
+  type: string;
+}
+
+export interface ICreate extends IChange {
+  type: 'create';
+  prop: number | string;
+}
+
+export interface IReplace extends IChange {
+  type: 'replace';
+}
+
+export interface IDelete extends IChange {
+  type: 'delete';
+  prop: number | string;
+}
+
+export interface IReverse extends IChange {
+  type: 'reverse';
+}
+
+export interface ISort extends IChange {
+  type: 'sort';
+}
+
+export interface IPush extends IChange {
+  type: 'push';
+  added: unknown[];
+}
+
+export interface IPop extends IChange {
+  type: 'pop';
+  removed: unknown[];
+}
+
+export interface IShift extends IChange {
+  type: 'shift';
+  removed: unknown[];
+}
+
+export interface IUnShift extends IChange {
+  type: 'unshift';
+  added: unknown[];
+}
+
+export interface ISplice extends IChange {
+  type: 'splice';
+  startIndex: number;
+  deleteCount: number;
+  added: unknown[];
+  removed: unknown[];
+}
+
+export interface ICopyWithin extends IChange {
+  type: 'copyWithin';
+  startIndex: number;
+  endIndex: number;
+  added: unknown[];
+  removed: unknown[];
+}
+
+export type Change =
+  | ICreate
+  | IReplace
+  | IDelete
+  | IReverse
+  | ISort
+  | IPush
+  | IPop
+  | IUnShift
+  | IShift
+  | ISplice
+  | ICopyWithin;
+
+const emptyControlFlowTargets: readonly ControlFlowTarget[] = [];
+
+export function normalizeStatementLabel(label: StatementLabel | undefined) {
+  return label === undefined || label === LispType.None ? undefined : label;
+}
+
+export function normalizeStatementLabels(label: LispItem | StatementLabel | undefined) {
+  if (label === undefined || label === LispType.None) return [] as string[];
+  if (Array.isArray(label) && !isLisp(label)) {
+    return label.filter((item): item is string => typeof item === 'string');
+  }
+  return [label as string];
+}
+
+export function createLoopTarget(label?: string, acceptsUnlabeled = true): ControlFlowTarget {
+  return {
+    label,
+    acceptsBreak: true,
+    acceptsContinue: true,
+    acceptsUnlabeledBreak: acceptsUnlabeled,
+    acceptsUnlabeledContinue: acceptsUnlabeled,
+  };
+}
+
+export function createSwitchTarget(label?: string): ControlFlowTarget {
+  return {
+    label,
+    acceptsBreak: true,
+    acceptsContinue: false,
+    acceptsUnlabeledBreak: true,
+    acceptsUnlabeledContinue: false,
+  };
+}
+
+export function createLabeledStatementTarget(label?: string): ControlFlowTarget | undefined {
+  if (!label) return undefined;
+  return {
+    label,
+    acceptsBreak: true,
+    acceptsContinue: false,
+    acceptsUnlabeledBreak: false,
+    acceptsUnlabeledContinue: false,
+  };
+}
+
+export function addControlFlowTarget(
+  controlFlowTargets: ControlFlowTargets,
+  target?: ControlFlowTarget,
+): ControlFlowTargets {
+  if (!target) return controlFlowTargets;
+  return [...(controlFlowTargets || emptyControlFlowTargets), target];
+}
+
+export function addControlFlowTargets(
+  controlFlowTargets: ControlFlowTargets,
+  targets: ControlFlowTarget[],
+): ControlFlowTargets {
+  return targets.reduce(
+    (currentTargets, target) => addControlFlowTarget(currentTargets, target),
+    controlFlowTargets,
+  );
+}
+
+export function matchesControlFlowTarget(signal: ControlFlowSignal, target: ControlFlowTarget) {
+  if (signal.type === 'continue') {
+    if (!target.acceptsContinue) return false;
+    return signal.label ? target.label === signal.label : target.acceptsUnlabeledContinue;
+  }
+  if (!target.acceptsBreak) return false;
+  return signal.label ? target.label === signal.label : target.acceptsUnlabeledBreak;
+}
+
+export function findControlFlowTarget(
+  controlFlowTargets: ControlFlowTargets,
+  type: ControlFlowAction,
+  label?: string,
+) {
+  if (!controlFlowTargets) return undefined;
+  for (let i = controlFlowTargets.length - 1; i >= 0; i--) {
+    const target = controlFlowTargets[i];
+    if (label) {
+      if (target.label !== label) continue;
+      if (type === 'continue' ? target.acceptsContinue : target.acceptsBreak) {
+        return target;
+      }
+      return null;
+    }
+    if (type === 'continue' ? target.acceptsUnlabeledContinue : target.acceptsUnlabeledBreak) {
+      return target;
+    }
+  }
+  return undefined;
+}
+
+function generateArgs(argNames: string[], args: unknown[]) {
+  const vars: Record<string, unknown> = {};
+  argNames.forEach((arg, i) => {
+    if (arg.startsWith('...')) {
+      vars[arg.substring(3)] = args.slice(i);
+    } else {
+      vars[arg] = args[i];
+    }
+  });
+  return vars;
+}
+
+export function createFunction(
+  argNames: string[],
+  parsed: Lisp[],
+  ticks: Ticks,
+  context: IExecContext,
+  scope?: Scope,
+  name?: string,
+  internal = false,
+) {
+  if (context.ctx.options.forbidFunctionCreation) {
+    throw new SandboxCapabilityError('Function creation is forbidden');
+  }
+  let func;
+  if (name === undefined) {
+    func = (...args: unknown[]) => {
+      const vars = generateArgs(argNames, args);
+      const res = executeTree(
+        ticks,
+        context,
+        parsed,
+        scope === undefined ? [] : [new Scope(scope, vars)],
+        undefined,
+        internal,
+      );
+      return res.result;
+    };
+  } else {
+    func = function sandboxedObject(this: Unknown, ...args: unknown[]) {
+      const vars = generateArgs(argNames, args);
+      const res = executeTree(
+        ticks,
+        context,
+        parsed,
+        scope === undefined ? [] : [new Scope(scope, vars, this)],
+        undefined,
+        internal,
+      );
+      return res.result;
+    };
+  }
+  context.registerSandboxFunction(func);
+  context.ctx.sandboxedFunctions.add(func);
+  return func;
+}
+
+export function createFunctionAsync(
+  argNames: string[],
+  parsed: Lisp[],
+  ticks: Ticks,
+  context: IExecContext,
+  scope?: Scope,
+  name?: string,
+  internal = false,
+) {
+  if (context.ctx.options.forbidFunctionCreation) {
+    throw new SandboxCapabilityError('Function creation is forbidden');
+  }
+  if (!context.ctx.prototypeWhitelist?.has(Promise.prototype)) {
+    throw new SandboxCapabilityError('Async/await not permitted');
+  }
+  let func;
+  if (name === undefined) {
+    func = async (...args: unknown[]) => {
+      const vars = generateArgs(argNames, args);
+      const res = await executeTreeAsync(
+        ticks,
+        context,
+        parsed,
+        scope === undefined ? [] : [new Scope(scope, vars)],
+        undefined,
+        internal,
+      );
+      return res.result;
+    };
+  } else {
+    func = async function sandboxedObject(this: Unknown, ...args: unknown[]) {
+      const vars = generateArgs(argNames, args);
+      const res = await executeTreeAsync(
+        ticks,
+        context,
+        parsed,
+        scope === undefined ? [] : [new Scope(scope, vars, this)],
+        undefined,
+        internal,
+      );
+      return res.result;
+    };
+  }
+  context.registerSandboxFunction(func);
+  context.ctx.sandboxedFunctions.add(func);
+  return func;
+}
+
+// Sentinel class used to communicate yield values from the executor back to the generator.
+export class YieldValue {
+  constructor(
+    public value: unknown,
+    public delegate: boolean,
+  ) {}
+}
+
+// Unique sentinel thrown by captureYieldFn in executeGenBody's default case when a new
+// synchronous yield is encountered. Propagates through the call stack back to the restart loop.
+const syncYieldPauseSentinel = Symbol('syncYieldPause');
+
+function asIterableIterator(value: unknown): Iterator<unknown> & Iterable<unknown> {
+  const iterator =
+    (value as { [Symbol.iterator]?: () => Iterator<unknown> })?.[Symbol.iterator]?.() ??
+    (value as Iterator<unknown>);
+
+  if (!iterator || typeof iterator.next !== 'function') {
+    throw new TypeError('yield* target is not iterable');
+  }
+
+  if (typeof (iterator as Iterator<unknown> & Iterable<unknown>)[Symbol.iterator] === 'function') {
+    return iterator as Iterator<unknown> & Iterable<unknown>;
+  }
+
+  return {
+    next: iterator.next.bind(iterator),
+    throw: iterator.throw?.bind(iterator),
+    return: iterator.return?.bind(iterator),
+    [Symbol.iterator]() {
+      return this;
+    },
+  };
+}
+
+function asAsyncIterableIterator(value: unknown): AsyncIterator<unknown> & AsyncIterable<unknown> {
+  const asyncIterator = (value as { [Symbol.asyncIterator]?: () => AsyncIterator<unknown> })?.[
+    Symbol.asyncIterator
+  ]?.();
+
+  if (asyncIterator) {
+    return {
+      next: asyncIterator.next.bind(asyncIterator),
+      throw: asyncIterator.throw?.bind(asyncIterator),
+      return: asyncIterator.return?.bind(asyncIterator),
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
+  }
+
+  const iterator = asIterableIterator(value);
+  return {
+    async next(nextValue?: unknown) {
+      return iterator.next(nextValue);
+    },
+    async throw(err?: unknown) {
+      if (typeof iterator.throw === 'function') {
+        return iterator.throw(err);
+      }
+      throw err;
+    },
+    async return(valueToReturn?: unknown) {
+      if (typeof iterator.return === 'function') {
+        return iterator.return(valueToReturn);
+      }
+      return { value: valueToReturn, done: true };
+    },
+    [Symbol.asyncIterator]() {
+      return this;
+    },
+  };
+}
+
+// executeGenBody: a native generator that lazily executes a generator function body.
+// It handles compound control-flow nodes (statements, if, loop, try, yield) with yield*
+// recursion, and falls back to the existing execSync for all leaf expressions.
+// Only used by createGeneratorFunction — nothing else in the executor is changed.
+function* executeGenBody(
+  ticks: Ticks,
+  tree: Lisp | Lisp[],
+  scope: Scope,
+  context: IExecContext,
+  statementLabels: ControlFlowTargets,
+  internal: boolean,
+): Generator<unknown, ExecReturn<unknown> | unknown, unknown> {
+  // ── Statement list ──────────────────────────────────────────────────────────
+  if (!isLisp(tree as Lisp) && Array.isArray(tree)) {
+    const stmts = tree as Lisp[];
+    if (stmts.length === 0 || (stmts[0] as unknown) === LispType.None) {
+      return new ExecReturn(context.ctx.auditReport, undefined, false);
+    }
+    for (const stmt of stmts) {
+      const res = (yield* executeGenBody(
+        ticks,
+        stmt,
+        scope,
+        context,
+        statementLabels,
+        internal,
+      )) as ExecReturn<unknown>;
+      if (res instanceof ExecReturn && (res.returned || res.controlFlow)) return res;
+      // Mirror _executeWithDoneSync: wrap the result of a return statement
+      if (isLisp(stmt) && (stmt as Lisp)[0] === LispType.Return) {
+        return new ExecReturn(context.ctx.auditReport, res.result, true);
+      }
+    }
+    return new ExecReturn(context.ctx.auditReport, undefined, false);
+  }
+
+  const [op, a, b] = tree as Lisp;
+
+  switch (op) {
+    // ── yield expr ────────────────────────────────────────────────────────────
+    case LispType.Yield: {
+      const valResult = (yield* executeGenBody(
+        ticks,
+        a as Lisp,
+        scope,
+        context,
+        statementLabels,
+        internal,
+      )) as ExecReturn<unknown>;
+      const sanitized = sanitizeProp(valResult.result, context);
+      const injected: unknown = yield sanitized; // ← real pause point
+      return new ExecReturn(context.ctx.auditReport, injected, false);
+    }
+
+    // ── yield* expr ───────────────────────────────────────────────────────────
+    case LispType.YieldDelegate: {
+      const iterResult = (yield* executeGenBody(
+        ticks,
+        a as Lisp,
+        scope,
+        context,
+        statementLabels,
+        internal,
+      )) as ExecReturn<unknown>;
+      const delegatee = sanitizeProp(iterResult.result, context);
+      const result: unknown = yield* asIterableIterator(delegatee);
+      return new ExecReturn(context.ctx.auditReport, result, false);
+    }
+
+    // ── if / else ─────────────────────────────────────────────────────────────
+    // LispType.If is NOT in unexecTypes — its `a` is the raw condition Lisp,
+    // `b` is the raw IfCase node that evaluates to an If object with .t/.f.
+    case LispType.If: {
+      const condResult = (yield* executeGenBody(
+        ticks,
+        a as Lisp,
+        scope,
+        context,
+        statementLabels,
+        internal,
+      )) as ExecReturn<unknown>;
+      const ifCase = syncDone((d) =>
+        execSync(ticks, b as Lisp, scope, context, d, statementLabels, internal, undefined),
+      ).result as If;
+      const branch = sanitizeProp(condResult.result, context) ? ifCase.t : ifCase.f;
+      if (branch) {
+        return (yield* executeGenBody(
+          ticks,
+          branch,
+          scope,
+          context,
+          statementLabels,
+          internal,
+        )) as ExecReturn<unknown>;
+      }
+      return new ExecReturn(context.ctx.auditReport, undefined, false);
+    }
+
+    // ── loops (while / for / for-of / for-in / do-while) ─────────────────────
+    // Mirror the sync path of the existing Loop handler (executor.ts ~1421-1475)
+    // but replace `executeTree(b, ...)` with `yield*`.
+    case LispType.Loop: {
+      const [
+        checkFirst,
+        startInternal,
+        getIterator,
+        startStep,
+        step,
+        condition,
+        beforeStep,
+        isForAwait,
+        label,
+      ] = a as Lisp[];
+      if ((isForAwait as unknown as LispType) === LispType.True) {
+        throw new SyntaxError('for-await-of loops are only allowed inside async functions');
+      }
+      const loopStatementTargets = [
+        ...normalizeStatementLabels(label).map((loopLabel) => createLoopTarget(loopLabel, false)),
+        createLoopTarget(),
+      ];
+      const loopTargets = addControlFlowTargets(statementLabels, loopStatementTargets);
+      const loopScope = new Scope(scope, {});
+      const internalVars: Record<string, unknown> = { $$obj: undefined };
+      const interalScope = new Scope(loopScope, internalVars);
+
+      syncDone((d) =>
+        execSync(ticks, startStep, loopScope, context, d, undefined, internal, undefined),
+      );
+      internalVars['$$obj'] = syncDone((d) =>
+        execSync(ticks, getIterator, loopScope, context, d, undefined, internal, undefined),
+      ).result;
+      syncDone((d) =>
+        execSync(ticks, startInternal, interalScope, context, d, undefined, internal, undefined),
+      );
+
+      let loop: unknown = true;
+      if (checkFirst) {
+        loop = syncDone((d) =>
+          execSync(ticks, condition, interalScope, context, d, undefined, internal, undefined),
+        ).result;
+      }
+
+      while (loop) {
+        const iterScope = new Scope(interalScope, {});
+        syncDone((d) =>
+          execSync(ticks, beforeStep, iterScope, context, d, undefined, internal, undefined),
+        );
+
+        const res = (yield* executeGenBody(
+          ticks,
+          b as Lisp[],
+          iterScope,
+          context,
+          loopTargets,
+          internal,
+        )) as ExecReturn<unknown>;
+
+        if (res.returned) return res;
+        if (res.controlFlow) {
+          if (!loopStatementTargets.some((t) => matchesControlFlowTarget(res.controlFlow!, t))) {
+            return res; // break/continue targeting an outer labeled loop
+          }
+          if (res.breakLoop) break;
+          // continueLoop: fall through to step + condition check
+        }
+        syncDone((d) =>
+          execSync(ticks, step, interalScope, context, d, undefined, internal, undefined),
+        );
+        loop = syncDone((d) =>
+          execSync(ticks, condition, interalScope, context, d, undefined, internal, undefined),
+        ).result;
+      }
+      return new ExecReturn(context.ctx.auditReport, undefined, false);
+    }
+
+    // ── try / catch / finally ─────────────────────────────────────────────────
+    // Using real native try/catch/finally gives us correct gen.throw() and
+    // gen.return() semantics for free (the native generator machinery handles them).
+    case LispType.Try: {
+      const [exception, catchBody, finallyBody] = b as [string, Lisp[], Lisp[]];
+      let result!: ExecReturn<unknown>;
+      let finalOverride: ExecReturn<unknown> | undefined;
+      try {
+        result = (yield* executeGenBody(
+          ticks,
+          a as Lisp[],
+          scope,
+          context,
+          statementLabels,
+          internal,
+        )) as ExecReturn<unknown>;
+      } catch (e) {
+        if (exception && catchBody?.length > 0) {
+          const catchScope = new Scope(scope, { [exception]: e });
+          result = (yield* executeGenBody(
+            ticks,
+            catchBody,
+            catchScope,
+            context,
+            statementLabels,
+            internal,
+          )) as ExecReturn<unknown>;
+        } else {
+          throw e;
+        }
+      } finally {
+        if (finallyBody?.length > 0) {
+          const fr = (yield* executeGenBody(
+            ticks,
+            finallyBody,
+            scope,
+            context,
+            statementLabels,
+            internal,
+          )) as ExecReturn<unknown>;
+          // finally control flow (return/break/continue) overrides everything
+          if (fr.returned || fr.controlFlow) {
+            finalOverride = fr;
+          }
+        }
+      }
+      if (finalOverride) return finalOverride;
+      return result;
+    }
+
+    // ── labeled statement ─────────────────────────────────────────────────────
+    case LispType.Labeled: {
+      const target = createLabeledStatementTarget(normalizeStatementLabel(a as StatementLabel));
+      const newTargets = addControlFlowTargets(statementLabels, target ? [target] : []);
+      const res = (yield* executeGenBody(
+        ticks,
+        b as Lisp,
+        scope,
+        context,
+        newTargets,
+        internal,
+      )) as ExecReturn<unknown>;
+      if (res.controlFlow && target && matchesControlFlowTarget(res.controlFlow, target)) {
+        return new ExecReturn(context.ctx.auditReport, res.result, false);
+      }
+      return res;
+    }
+
+    // ── everything else ───────────────────────────────────────────────────────
+    // Arithmetic, property access, function calls, assignments, etc. are
+    // delegated to execSync. However, a yield expression may be nested inside
+    // a non-unexecType node (e.g. `const x = yield 1`). In that case the
+    // existing sync yield handler throws syncYieldPauseSentinel. We restart
+    // execSync from scratch on each such pause, skipping already-completed
+    // yields by immediately calling their continuation with the stored result.
+    default: {
+      let completedYields = 0;
+      const yieldResults: unknown[] = [];
+      while (true) {
+        let currentYieldIdx = 0;
+        let capturedValue: unknown = undefined;
+        let capturedDelegate = false;
+        let yielded = false;
+        const captureYieldFn = (yv: YieldValue, continueDone?: Done) => {
+          if (currentYieldIdx < completedYields) {
+            // This yield already happened in a prior iteration; fast-forward.
+            continueDone!(undefined, yieldResults[currentYieldIdx]);
+            currentYieldIdx++;
+            return;
+          }
+          // New yield: capture the value and pause.
+          capturedValue = yv.value;
+          capturedDelegate = yv.delegate;
+          yielded = true;
+          currentYieldIdx++;
+          throw syncYieldPauseSentinel;
+        };
+        try {
+          const result = syncDone((d) =>
+            execSync(
+              ticks,
+              tree as Lisp,
+              scope,
+              context,
+              d,
+              statementLabels,
+              internal,
+              captureYieldFn,
+            ),
+          ).result;
+          if (result instanceof ExecReturn) return result;
+          return new ExecReturn(context.ctx.auditReport, result, false);
+        } catch (e) {
+          if (!yielded || e !== syncYieldPauseSentinel) throw e;
+          const resumedValue: unknown = capturedDelegate
+            ? yield* asIterableIterator(capturedValue)
+            : yield capturedValue;
+          yieldResults.push(resumedValue);
+          completedYields++;
+        }
+      }
+    }
+  }
+}
+
+export function createGeneratorFunction(
+  argNames: string[],
+  parsed: Lisp[],
+  ticks: Ticks,
+  context: IExecContext,
+  scope?: Scope,
+  name?: string,
+  internal = false,
+) {
+  if (context.ctx.options.forbidFunctionCreation) {
+    throw new SandboxCapabilityError('Function creation is forbidden');
+  }
+  const makeGen = (thisArg: Unknown, args: unknown[]) => {
+    const vars = generateArgs(argNames, args);
+    const genScope =
+      scope === undefined ? new Scope(null, vars, thisArg) : new Scope(scope, vars, thisArg);
+
+    const executionGen = executeGenBody(ticks, parsed, genScope, context, undefined, internal);
+    let isDone = false;
+
+    function drive(action: () => IteratorResult<unknown>): IteratorResult<unknown> {
+      if (isDone) return { value: undefined, done: true };
+      try {
+        const r = action();
+        if (r.done) {
+          isDone = true;
+          return {
+            value: r.value instanceof ExecReturn ? r.value.result : r.value,
+            done: true,
+          };
+        }
+        return { value: r.value, done: false };
+      } catch (e) {
+        isDone = true;
+        throw e;
+      }
+    }
+
+    const iterator: Iterator<unknown> & Iterable<unknown> = {
+      next(value?: unknown) {
+        return drive(() => executionGen.next(value));
+      },
+      return(value?: unknown) {
+        return drive(() => executionGen.return(value));
+      },
+      throw(err?: unknown) {
+        return drive(() => executionGen.throw(err));
+      },
+      [Symbol.iterator]() {
+        return this;
+      },
+    };
+    return iterator;
+  };
+  const func = function sandboxedObject(this: Unknown, ...args: unknown[]) {
+    return makeGen(this, args);
+  };
+  Object.setPrototypeOf(func, GeneratorFunction.prototype);
+  context.registerSandboxFunction(func);
+  context.ctx.sandboxedFunctions.add(func);
+  return func;
+}
+
+export function createAsyncGeneratorFunction(
+  argNames: string[],
+  parsed: Lisp[],
+  ticks: Ticks,
+  context: IExecContext,
+  scope?: Scope,
+  name?: string,
+  internal = false,
+) {
+  if (context.ctx.options.forbidFunctionCreation) {
+    throw new SandboxCapabilityError('Function creation is forbidden');
+  }
+  if (!context.ctx.prototypeWhitelist?.has(Promise.prototype)) {
+    throw new SandboxCapabilityError('Async/await not permitted');
+  }
+  const makeGen = (thisArg: Unknown, args: unknown[]) => {
+    const vars = generateArgs(argNames, args);
+    const genScope =
+      scope === undefined ? [new Scope(null, vars, thisArg)] : [new Scope(scope, vars, thisArg)];
+    return (async function* sandboxedAsyncGenerator(): AsyncGenerator<unknown, unknown, unknown> {
+      const yieldQueue: Array<{ yieldValue: YieldValue; continueDone?: Done }> = [];
+      let resolveYield: (() => void) | null = null;
+      const yieldFn = (yv: YieldValue, continueDone?: Done) => {
+        yieldQueue.push({ yieldValue: yv, continueDone });
+        if (resolveYield) {
+          resolveYield();
+          resolveYield = null;
+        }
+      };
+      const bodyPromise = executeTreeAsync(
+        ticks,
+        context,
+        parsed,
+        genScope,
+        undefined,
+        internal,
+        yieldFn,
+      );
+      let bodyDone = false;
+      let bodyResult: ExecReturn<unknown> | undefined;
+      let bodyError: unknown;
+      bodyPromise.then(
+        (r) => {
+          bodyDone = true;
+          bodyResult = r;
+          resolveYield?.();
+        },
+        (e) => {
+          bodyDone = true;
+          bodyError = e;
+          resolveYield?.();
+        },
+      );
+      while (true) {
+        if (yieldQueue.length === 0 && !bodyDone) {
+          await new Promise<void>((res) => {
+            resolveYield = res;
+          });
+        }
+        while (yieldQueue.length > 0) {
+          const { yieldValue, continueDone } = yieldQueue.shift()!;
+          try {
+            const resumedValue = yieldValue.delegate
+              ? yield* asAsyncIterableIterator(yieldValue.value)
+              : yield yieldValue.value;
+            continueDone?.(undefined, resumedValue);
+          } catch (err) {
+            continueDone?.(err);
+          }
+        }
+        if (bodyDone) break;
+      }
+      if (bodyError !== undefined) throw bodyError;
+      return bodyResult?.result;
+    })();
+  };
+  const func = function sandboxedObject(this: Unknown, ...args: unknown[]) {
+    return makeGen(this, args) as unknown as AsyncGenerator;
+  };
+  Object.setPrototypeOf(func, AsyncGeneratorFunction.prototype);
+  context.registerSandboxFunction(func);
+  context.ctx.sandboxedFunctions.add(func);
+  return func;
+}
+
+export function assignCheck(obj: Prop, context: IExecContext, op = 'assign') {
+  if (obj.context === undefined) {
+    throw new ReferenceError(`Cannot ${op} value to undefined.`);
+  }
+  if (obj.isConst) {
+    throw new TypeError(`Assignment to constant variable.`);
+  }
+  if (obj.isGlobal) {
+    throw new SandboxAccessError(
+      `Cannot ${op} property '${obj.prop.toString()}' of a global object`,
+    );
+  }
+  if (obj.context === null) {
+    throw new TypeError('Cannot set properties of null');
+  }
+  if (
+    typeof (obj.context as any)[obj.prop] === 'function' &&
+    !hasOwnProperty(obj.context, obj.prop)
+  ) {
+    throw new SandboxAccessError(
+      `Override prototype property '${obj.prop.toString()}' not allowed`,
+    );
+  }
+  if (op === 'delete') {
+    if (hasOwnProperty(obj.context, obj.prop)) {
+      context.changeSubscriptions
+        .get(obj.context)
+        ?.forEach((cb) => cb({ type: 'delete', prop: obj.prop.toString() }));
+      context.changeSubscriptionsGlobal
+        .get(obj.context)
+        ?.forEach((cb) => cb({ type: 'delete', prop: obj.prop.toString() }));
+    }
+  } else if (hasOwnProperty(obj.context, obj.prop)) {
+    context.setSubscriptions
+      .get(obj.context)
+      ?.get(obj.prop.toString())
+      ?.forEach((cb) =>
+        cb({
+          type: 'replace',
+        }),
+      );
+    context.setSubscriptionsGlobal
+      .get(obj.context)
+      ?.get(obj.prop.toString())
+      ?.forEach((cb) =>
+        cb({
+          type: 'replace',
+        }),
+      );
+  } else {
+    context.changeSubscriptions
+      .get(obj.context)
+      ?.forEach((cb) => cb({ type: 'create', prop: obj.prop.toString() }));
+    context.changeSubscriptionsGlobal
+      .get(obj.context)
+      ?.forEach((cb) => cb({ type: 'create', prop: obj.prop.toString() }));
+  }
+}
+export const arrayChange = new Set([
+  [].push,
+  [].pop,
+  [].shift,
+  [].unshift,
+  [].splice,
+  [].reverse,
+  [].sort,
+  [].copyWithin,
+]);
+
+export class KeyVal {
+  constructor(
+    public key: PropertyKey | SpreadObject,
+    public val: unknown,
+  ) {}
+}
+
+export class SpreadObject {
+  constructor(public item: { [key: string]: unknown }) {}
+}
+
+export class SpreadArray {
+  constructor(public item: unknown[]) {}
+}
+
+export class ArrayHole {}
+
+export class If {
+  constructor(
+    public t: Lisp,
+    public f: Lisp,
+    public label?: string,
+  ) {}
+}
+
+export const literalRegex = /(\$\$)*(\$)?\${(\d+)}/g;
+
+export { ops, addOps } from './opsRegistry';
+import { ops, Execution } from './opsRegistry';
+
+export const prorptyKeyTypes = ['string', 'number', 'symbol'];
+
+export function isPropertyKey(val: unknown): val is PropertyKey {
+  return prorptyKeyTypes.includes(typeof val);
+}
+
+export function hasPossibleProperties(val: unknown): val is {} {
+  return val !== null && val !== undefined;
+}
+
+import './ops/index';
+
+export function execMany(
+  ticks: Ticks,
+  exec: Execution,
+  tree: Lisp[],
+  done: Done,
+  scope: Scope,
+  context: IExecContext,
+  statementLabels: ControlFlowTargets,
+  internal: boolean,
+  generatorYield: ((yv: YieldValue, done?: Done) => void) | undefined,
+) {
+  if (exec === execSync) {
+    _execManySync(ticks, tree, done, scope, context, statementLabels, internal, generatorYield);
+  } else {
+    _execManyAsync(
+      ticks,
+      tree,
+      done,
+      scope,
+      context,
+      statementLabels,
+      internal,
+      generatorYield,
+    ).catch(done);
+  }
+}
+
+function _execManySync(
+  ticks: Ticks,
+  tree: Lisp[],
+  done: Done,
+  scope: Scope,
+  context: IExecContext,
+  statementLabels: ControlFlowTargets,
+  internal: boolean,
+  generatorYield: ((yv: YieldValue, done?: Done) => void) | undefined,
+) {
+  const ret: any[] = [];
+  for (let i = 0; i < tree.length; i++) {
+    let res = syncDone((d) =>
+      execSync(ticks, tree[i], scope, context, d, statementLabels, internal, generatorYield),
+    ).result;
+    if (res instanceof ExecReturn && (res.returned || res.breakLoop || res.continueLoop)) {
+      done(undefined, res);
+      return;
+    }
+    if (isLisp(tree[i]) && tree[i][0] === LispType.Return) {
+      done(undefined, new ExecReturn(context.ctx.auditReport, res, true));
+      return;
+    }
+    ret.push(res);
+  }
+  done(undefined, ret);
+}
+
+async function _execManyAsync(
+  ticks: Ticks,
+  tree: Lisp[],
+  done: Done,
+  scope: Scope,
+  context: IExecContext,
+  statementLabels: ControlFlowTargets,
+  internal: boolean,
+  generatorYield: ((yv: YieldValue, done?: Done) => void) | undefined,
+) {
+  const ret: any[] = [];
+  for (let i = 0; i < tree.length; i++) {
+    let res;
+    try {
+      let ad: AsyncDoneRet;
+      res =
+        (ad = asyncDone((d) =>
+          execAsync(ticks, tree[i], scope, context, d, statementLabels, internal, generatorYield),
+        )).isInstant === true
+          ? ad.instant
+          : (await ad.p).result;
+    } catch (e) {
+      done(e);
+      return;
+    }
+    if (res instanceof ExecReturn && (res.returned || res.breakLoop || res.continueLoop)) {
+      done(undefined, res);
+      return;
+    }
+    if (isLisp(tree[i]) && tree[i][0] === LispType.Return) {
+      done(undefined, new ExecReturn(context.ctx.auditReport, res, true));
+      return;
+    }
+    ret.push(res);
+  }
+  done(undefined, ret);
+}
+
+export interface AsyncDoneRet {
+  isInstant: boolean;
+  instant: any;
+  p: Promise<{ result: any }>;
+}
+
+export function asyncDone(callback: (done: Done) => void): AsyncDoneRet {
+  let isInstant = false;
+  let instant: unknown;
+  const p = new Promise<any>((resolve, reject) => {
+    callback((...args: unknown[]) => {
+      if (args.length === 1) reject(args[0]);
+      else {
+        isInstant = true;
+        instant = args[1];
+        resolve({ result: args[1] });
+      }
+    });
+  });
+  return {
+    isInstant,
+    instant,
+    p,
+  };
+}
+
+export function syncDone(callback: (done: Done) => void): { result: any } {
+  let result;
+  let err: { error: unknown } | undefined;
+  callback((...args: unknown[]) => {
+    err = args.length === 1 ? { error: args[0] } : undefined;
+    result = args[1];
+  });
+  if (err) throw err.error;
+  return { result };
+}
+
+export async function execAsync<T = any>(
+  ticks: Ticks,
+  tree: LispItem,
+  scope: Scope,
+  context: IExecContext,
+  doneOriginal: Done<T>,
+  statementLabels: ControlFlowTargets,
+  internal: boolean,
+  generatorYield: ((yv: YieldValue, done?: Done) => void) | undefined,
+): Promise<void> {
+  let done: Done<T> = doneOriginal;
+  const p = new Promise<void>((resolve) => {
+    done = (...args: unknown[]) => {
+      doneOriginal(...args);
+      resolve();
+    };
+  });
+  if (
+    !_execNoneRecurse(
+      ticks,
+      tree,
+      scope,
+      context,
+      done,
+      true,
+      statementLabels,
+      internal,
+      generatorYield,
+    ) &&
+    isLisp(tree)
+  ) {
+    let op = tree[0];
+    let obj;
+    try {
+      let ad: AsyncDoneRet;
+      obj =
+        (ad = asyncDone((d) =>
+          execAsync(ticks, tree[1], scope, context, d, statementLabels, internal, generatorYield),
+        )).isInstant === true
+          ? ad.instant
+          : (await ad.p).result;
+    } catch (e) {
+      done(e);
+      return;
+    }
+    let a = obj;
+    try {
+      a = obj instanceof Prop ? obj.get(context) : obj;
+    } catch (e) {
+      done(e);
+      return;
+    }
+    if (op === LispType.PropOptional || op === LispType.CallOptional) {
+      if (a === undefined || a === null) {
+        done(undefined, optional);
+        return;
+      }
+      op = op === LispType.PropOptional ? LispType.Prop : LispType.Call;
+    }
+    if (a === optional) {
+      if (op === LispType.Prop || op === LispType.Call) {
+        done(undefined, a);
+        return;
+      } else {
+        a = undefined;
+      }
+    }
+    // Short-circuit for nullish coalescing: if a is not null/undefined, return a without evaluating b
+    if (op === LispType.NullishCoalescing && a !== undefined && a !== null) {
+      done(undefined, a);
+      return;
+    }
+    let bobj;
+    try {
+      let ad: AsyncDoneRet;
+      bobj =
+        (ad = asyncDone((d) =>
+          execAsync(ticks, tree[2], scope, context, d, statementLabels, internal, generatorYield),
+        )).isInstant === true
+          ? ad.instant
+          : (await ad.p).result;
+    } catch (e) {
+      done(e);
+      return;
+    }
+    let b = bobj;
+    try {
+      b = bobj instanceof Prop ? bobj.get(context) : bobj;
+    } catch (e) {
+      done(e);
+      return;
+    }
+    if (b === optional) {
+      b = undefined;
+    }
+    performOp({
+      op,
+      exec: execAsync,
+      done,
+      ticks,
+      a,
+      b,
+      obj,
+      context,
+      scope,
+      bobj,
+      statementLabels,
+      internal,
+      generatorYield,
+      tree,
+    });
+  }
+  await p;
+}
+
+export function execSync<T = any>(
+  ticks: Ticks,
+  tree: LispItem,
+  scope: Scope,
+  context: IExecContext,
+  done: Done<T>,
+  statementLabels: ControlFlowTargets,
+  internal: boolean,
+  generatorYield: ((yv: YieldValue, done?: Done) => void) | undefined,
+) {
+  if (
+    !_execNoneRecurse(
+      ticks,
+      tree,
+      scope,
+      context,
+      done,
+      false,
+      statementLabels,
+      internal,
+      generatorYield,
+    ) &&
+    isLisp(tree)
+  ) {
+    let op = tree[0];
+    let obj = syncDone((d) =>
+      execSync(ticks, tree[1], scope, context, d, statementLabels, internal, generatorYield),
+    ).result;
+    let a = obj instanceof Prop ? obj.get(context) : obj;
+    if (op === LispType.PropOptional || op === LispType.CallOptional) {
+      if (a === undefined || a === null) {
+        done(undefined, optional);
+        return;
+      }
+      op = op === LispType.PropOptional ? LispType.Prop : LispType.Call;
+    }
+    if (a === optional) {
+      if (op === LispType.Prop || op === LispType.Call) {
+        done(undefined, a);
+        return;
+      } else {
+        a = undefined;
+      }
+    }
+    // Short-circuit for nullish coalescing: if a is not null/undefined, return a without evaluating b
+    if (op === LispType.NullishCoalescing && a !== undefined && a !== null) {
+      done(undefined, a);
+      return;
+    }
+    let bobj = syncDone((d) =>
+      execSync(ticks, tree[2], scope, context, d, statementLabels, internal, generatorYield),
+    ).result;
+    let b = bobj instanceof Prop ? bobj.get(context) : bobj;
+    if (b === optional) {
+      b = undefined;
+    }
+    performOp({
+      op,
+      exec: execSync,
+      done,
+      ticks,
+      a,
+      b,
+      obj,
+      context,
+      scope,
+      bobj,
+      statementLabels,
+      internal,
+      generatorYield,
+      tree,
+    });
+  }
+}
+
+type OpsCallbackParams<a, b, obj, bobj> = {
+  op: LispType;
+  exec: Execution;
+  a: a;
+  b: b;
+  obj: obj;
+  bobj: bobj;
+  ticks: Ticks;
+  tree: LispItem;
+  scope: Scope;
+  context: IExecContext;
+  done: Done;
+  statementLabels: ControlFlowTargets;
+  internal: boolean;
+  generatorYield: ((yv: YieldValue, done?: Done) => void) | undefined;
+};
+
+export function checkHaltExpectedTicks(
+  params: OpsCallbackParams<any, any, any, any>,
+  expectTicks = 0n,
+): boolean {
+  const sandbox = params.context.ctx.sandbox;
+  const { ticks, scope, context } = params;
+  if (sandbox.halted) {
+    const sub = sandbox.subscribeResume(() => {
+      sub.unsubscribe();
+      performOp(params, false);
+    });
+    return true;
+  } else if (ticks.tickLimit !== undefined && ticks.tickLimit <= ticks.ticks + expectTicks) {
+    const error = new SandboxExecutionQuotaExceededError('Execution quota exceeded');
+    if (context.ctx.options.haltOnSandboxError) {
+      const sub = sandbox.subscribeResume(() => {
+        sub.unsubscribe();
+        performOp(params);
+      });
+      sandbox.haltExecution({
+        type: 'error',
+        error,
+        ticks,
+        scope,
+        context,
+      });
+    } else {
+      params.done(error);
+    }
+    return true;
+  } else if (ticks.nextYield && ticks.ticks > ticks.nextYield) {
+    const sub = sandbox.subscribeResume(() => {
+      sub.unsubscribe();
+      performOp(params, false);
+    });
+    ticks.nextYield += NON_BLOCKING_THRESHOLD;
+    sandbox.haltExecution({ type: 'yield' });
+    setTimeout(() => sandbox.resumeExecution());
+    return true;
+  }
+  ticks.ticks += expectTicks;
+  return false;
+}
+
+function performOp(params: OpsCallbackParams<any, any, any, any>, count = true) {
+  const { done, op, ticks, context, scope } = params;
+  if (count) {
+    ticks.ticks++;
+  }
+  const sandbox = context.ctx.sandbox;
+
+  try {
+    if (checkHaltExpectedTicks(params)) {
+      return;
+    }
+    const o = ops.get(op);
+    if (o === undefined) {
+      done(new SandboxExecutionTreeError('Unknown operator: ' + op));
+      return;
+    }
+    o(params);
+  } catch (err) {
+    if (context.ctx.options.haltOnSandboxError && err instanceof SandboxError) {
+      const sub = sandbox.subscribeResume(() => {
+        sub.unsubscribe();
+        done(err);
+      });
+      sandbox.haltExecution({
+        type: 'error',
+        error: err,
+        ticks,
+        scope,
+        context,
+      });
+    } else {
+      done(err);
+    }
+  }
+}
+
+const unexecTypes = new Set([
+  LispType.ArrowFunction,
+  LispType.Function,
+  LispType.InlineFunction,
+  LispType.Loop,
+  LispType.Try,
+  LispType.Switch,
+  LispType.IfCase,
+  LispType.InlineIfCase,
+  LispType.Labeled,
+  LispType.Typeof,
+]);
+
+function _execNoneRecurse<T = any>(
+  ticks: Ticks,
+  tree: LispItem,
+  scope: Scope,
+  context: IExecContext,
+  done: Done<T>,
+  isAsync: boolean,
+  statementLabels: ControlFlowTargets,
+  internal: boolean,
+  generatorYield: ((yv: YieldValue, done?: Done) => void) | undefined,
+): boolean {
+  const exec = isAsync ? execAsync : execSync;
+  if (tree instanceof Prop) {
+    done(undefined, tree.get(context));
+  } else if (tree === optional) {
+    done();
+  } else if (Array.isArray(tree) && !isLisp(tree)) {
+    if (tree[0] === LispType.None) {
+      done();
+    } else {
+      execMany(
+        ticks,
+        exec,
+        tree as Lisp[],
+        done,
+        scope,
+        context,
+        statementLabels,
+        internal,
+        generatorYield,
+      );
+    }
+  } else if (!isLisp(tree)) {
+    done(undefined, tree);
+  } else if (tree[0] === LispType.Block) {
+    execMany(
+      ticks,
+      exec,
+      tree[1] as Lisp[],
+      done,
+      new Scope(scope),
+      context,
+      statementLabels,
+      internal,
+      generatorYield,
+    );
+  } else if (tree[0] === LispType.InternalBlock) {
+    execMany(
+      ticks,
+      exec,
+      tree[1] as Lisp[],
+      done,
+      scope,
+      context,
+      statementLabels,
+      true,
+      generatorYield,
+    );
+  } else if (tree[0] === LispType.Await) {
+    if (!isAsync) {
+      done(new SyntaxError("Illegal use of 'await', must be inside async function"));
+    } else if (context.ctx.prototypeWhitelist?.has(Promise.prototype)) {
+      execAsync(
+        ticks,
+        tree[1],
+        scope,
+        context,
+        async (...args: unknown[]) => {
+          if (args.length === 1) done(args[0]);
+          else
+            try {
+              done(undefined, (await sanitizeProp(args[1], context)) as any);
+            } catch (err) {
+              done(err);
+            }
+        },
+        statementLabels,
+        internal,
+        generatorYield,
+      ).catch(done);
+    } else {
+      done(new SandboxCapabilityError('Async/await is not permitted'));
+    }
+  } else if (tree[0] === LispType.Yield || tree[0] === LispType.YieldDelegate) {
+    const yieldFn = generatorYield;
+    if (!yieldFn) {
+      done(new SyntaxError("Illegal use of 'yield', must be inside a generator function"));
+      return true;
+    }
+    const isDelegate = tree[0] === LispType.YieldDelegate;
+    if (isAsync) {
+      execAsync(
+        ticks,
+        tree[1],
+        scope,
+        context,
+        async (...args: unknown[]) => {
+          if (args.length === 1) {
+            done(args[0]);
+            return;
+          }
+          try {
+            const val = await sanitizeProp(args[1], context);
+            yieldFn(new YieldValue(val, isDelegate), done);
+          } catch (err) {
+            done(err);
+          }
+        },
+        statementLabels,
+        internal,
+        generatorYield,
+      ).catch(done);
+    } else {
+      try {
+        const val = syncDone((d) =>
+          execSync(ticks, tree[1], scope, context, d, statementLabels, internal, generatorYield),
+        ).result;
+        const sanitized = sanitizeProp(val, context);
+        // Pass `done` as second arg so the yieldFn can call it with the injected value.
+        // For capture-mode yieldFns (executeGenBody default case), this enables the restart loop.
+        // For plain yieldFns (eager mode), done? is ignored and done() is called below.
+        yieldFn(new YieldValue(sanitized, isDelegate), done);
+        // If yieldFn did not call done (it threw syncYieldPauseSentinel instead), we fall through
+        // to the catch which re-throws the sentinel. Otherwise yieldFn called done itself.
+      } catch (err) {
+        if (err === syncYieldPauseSentinel) throw err; // propagate pause up to restart loop
+        done(err);
+      }
+    }
+  } else if (unexecTypes.has(tree[0])) {
+    performOp({
+      op: tree[0],
+      exec,
+      done,
+      ticks,
+      a: tree[1],
+      b: tree[2],
+      obj: tree,
+      tree,
+      context,
+      scope,
+      bobj: undefined,
+      statementLabels,
+      internal,
+      generatorYield,
+    });
+  } else {
+    return false;
+  }
+  return true;
+}
+export function executeTree<T>(
+  ticks: Ticks,
+  context: IExecContext,
+  executionTree: Lisp[],
+  scopes: IScope[] = [],
+  statementLabels: ControlFlowTargets,
+  internal: boolean,
+  generatorYield?: ((yv: YieldValue, done?: Done) => void) | undefined,
+): ExecReturn<T> {
+  return syncDone((done) =>
+    executeTreeWithDone(
+      execSync,
+      done,
+      ticks,
+      context,
+      executionTree,
+      scopes,
+      statementLabels,
+      internal,
+      generatorYield,
+    ),
+  ).result;
+}
+
+export async function executeTreeAsync<T>(
+  ticks: Ticks,
+  context: IExecContext,
+  executionTree: Lisp[],
+  scopes: IScope[] = [],
+  statementLabels: ControlFlowTargets,
+  internal: boolean,
+  generatorYield?: ((yv: YieldValue, done?: Done) => void) | undefined,
+): Promise<ExecReturn<T>> {
+  let ad: AsyncDoneRet;
+  return (ad = asyncDone((done) =>
+    executeTreeWithDone(
+      execAsync,
+      done,
+      ticks,
+      context,
+      executionTree,
+      scopes,
+      statementLabels,
+      internal,
+      generatorYield,
+    ),
+  )).isInstant === true
+    ? ad.instant
+    : (await ad.p).result;
+}
+
+export function executeTreeWithDone(
+  exec: Execution,
+  done: Done,
+  ticks: Ticks,
+  context: IExecContext,
+  executionTree: Lisp[],
+  scopes: IScope[] = [],
+  statementLabels: ControlFlowTargets,
+  internal: boolean,
+  generatorYield?: ((yv: YieldValue, done?: Done) => void) | undefined,
+) {
+  if (!executionTree) {
+    done();
+    return;
+  }
+  if (!(executionTree instanceof Array)) {
+    throw new SyntaxError('Bad execution tree');
+  }
+  let scope = context.ctx.globalScope;
+  let s;
+  while ((s = scopes.shift())) {
+    if (typeof s !== 'object') continue;
+    if (s instanceof Scope) {
+      scope = s;
+    } else {
+      scope = new Scope(scope, s, s instanceof LocalScope ? undefined : null);
+    }
+  }
+  if (context.ctx.options.audit && !context.ctx.auditReport) {
+    context.ctx.auditReport = {
+      globalsAccess: new Set(),
+      prototypeAccess: {},
+    };
+  }
+  if (exec === execSync) {
+    _executeWithDoneSync(
+      done,
+      ticks,
+      context,
+      executionTree,
+      scope,
+      statementLabels,
+      internal,
+      generatorYield,
+    );
+  } else {
+    _executeWithDoneAsync(
+      done,
+      ticks,
+      context,
+      executionTree,
+      scope,
+      statementLabels,
+      internal,
+      generatorYield,
+    ).catch(done);
+  }
+}
+
+function _executeWithDoneSync(
+  done: Done,
+  ticks: Ticks,
+  context: IExecContext,
+  executionTree: Lisp[],
+  scope: Scope,
+  statementLabels: ControlFlowTargets,
+  internal: boolean,
+  generatorYield: ((yv: YieldValue, done?: Done) => void) | undefined,
+) {
+  if (!(executionTree instanceof Array)) throw new SyntaxError('Bad execution tree');
+  let i = 0;
+  for (i = 0; i < executionTree.length; i++) {
+    let res: unknown;
+    let err: { error: unknown } | undefined;
+    const current = executionTree[i];
+    try {
+      execSync(
+        ticks,
+        current,
+        scope,
+        context,
+        (...args: unknown[]) => {
+          if (args.length === 1) err = { error: args[0] };
+          else res = args[1];
+        },
+        statementLabels,
+        internal,
+        generatorYield,
+      );
+    } catch (e) {
+      err = { error: e };
+    }
+    if (err) {
+      done(err.error);
+      return;
+    }
+    if (res instanceof ExecReturn) {
+      done(undefined, res);
+      return;
+    }
+    if (isLisp(current) && current[0] === LispType.Return) {
+      done(undefined, new ExecReturn(context.ctx.auditReport, res, true));
+      return;
+    }
+  }
+  done(undefined, new ExecReturn(context.ctx.auditReport, undefined, false));
+}
+
+async function _executeWithDoneAsync(
+  done: Done,
+  ticks: Ticks,
+  context: IExecContext,
+  executionTree: Lisp[],
+  scope: Scope,
+  statementLabels: ControlFlowTargets,
+  internal: boolean,
+  generatorYield: ((yv: YieldValue, done?: Done) => void) | undefined,
+) {
+  if (!(executionTree instanceof Array)) throw new SyntaxError('Bad execution tree');
+  let i = 0;
+  for (i = 0; i < executionTree.length; i++) {
+    let res: unknown;
+    let err: { error: unknown } | undefined;
+    const current = executionTree[i];
+    try {
+      await execAsync(
+        ticks,
+        current,
+        scope,
+        context,
+        (...args: unknown[]) => {
+          if (args.length === 1) err = { error: args[0] };
+          else res = args[1];
+        },
+        statementLabels,
+        internal,
+        generatorYield,
+      );
+    } catch (e) {
+      err = { error: e };
+    }
+    if (err) {
+      done(err.error);
+      return;
+    }
+    if (res instanceof ExecReturn) {
+      done(undefined, res);
+      return;
+    }
+    if (isLisp(current) && current[0] === LispType.Return) {
+      done(undefined, new ExecReturn(context.ctx.auditReport, res, true));
+      return;
+    }
+  }
+  done(undefined, new ExecReturn(context.ctx.auditReport, undefined, false));
+}

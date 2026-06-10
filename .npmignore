@@ -3,6 +3,8 @@ node_modules/
 .gitignore
 .git/
 .vscode/
+.husky
+.claude
 js/
 test/
 css/
@@ -13,6 +15,5 @@ rollup.config.mjs
 .eslintrc.json
 .prettierrc
 jest.config.js
-rollup.config.js
 tsconfig.jest.json
 package-lock.json

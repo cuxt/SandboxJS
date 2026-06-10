@@ -19,7 +19,7 @@ jobs:
           node-version: '22'
 
       - name: Install dependencies
-        run: npm ci
+        run: npm install
 
       - name: Build project
         run: npm run build
@@ -31,6 +31,7 @@ jobs:
           cp -r test pages/
           cp -r css pages/
           cp index.html pages/
+          cp logo.svg pages/
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
