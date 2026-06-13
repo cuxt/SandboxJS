@@ -1,20 +1,19 @@
 {
   "name": "@cuxt/sandboxjs",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "JavaScript sandboxing library with prototype whitelist and safe globals.",
-  "main": "dist/node/Sandbox.js",
-  "module": "build/Sandbox.js",
-  "browser": "dist/Sandbox.min.js",
+  "main": "dist/cjs/Sandbox.js",
+  "module": "dist/esm/Sandbox.js",
+  "browser": "dist/umd/Sandbox.min.js",
   "type": "module",
   "exports": {
     ".": {
-      "import": "./build/Sandbox.js",
-      "require": "./dist/node/Sandbox.js",
-      "types": "./build/Sandbox.d.ts"
+      "import": "./dist/esm/Sandbox.js",
+      "require": "./dist/cjs/Sandbox.js",
+      "types": "./dist/esm/Sandbox.d.ts"
     }
   },
   "files": [
-    "build",
     "dist"
   ],
   "scripts": {
